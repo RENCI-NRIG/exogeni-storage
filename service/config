@@ -1,0 +1,14 @@
+[network]
+listen-host = 127.0.0.1
+listen-port = 8000
+
+[runtime]
+passwd-file = /etc/storage_service/passwd
+key-file = /etc/storage_service/key.pem
+cert-file = /etc/storage_service/certificate.pem
+script-directory = /usr/share/storage_service/scripts
+script-file = iscsi-manager
+script-timeout = 300
+pid-directory = /var/run
+pid-file = storage_serviced.pid
+pool-workers = 20

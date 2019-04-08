@@ -1,0 +1,548 @@
+#!/bin/bash
+
+# A set of common routines for shell scripts managing ExoGENI compatible storage systems.
+# Root privileges required for any of the routines called below.
+# 
+# Anyone wishing to develop their own storage backend should first source this shell script, then implement their own
+# versions of the "create_vol" and "delete_vol" stub functions below.
+#
+# Daniel Romão - UvA
+# d.f.romao@uva.nl
+#
+# Victor J. Orlikowski - Duke
+# vjo@duke.edu
+
+# Improvements:
+# If $TARGET_IQN is not set, $TARGET_IQN=$TARGET_IQN_PREFIX:name. Don't perform the checks, and replace $target_name with $TARGET_IQN
+
+###
+# iSCSI volume manipulation functions
+# NOTE: *Both of these functions are stubs, and should be overridden in your own storage backend!*
+# Look at existing scripts for examples of how to do this, for your storage system.
+###
+
+# Stub volume creation function
+function create_vol {
+  show_n_log "Please override this function with one suitable for your storage backend." 1
+
+  return 1
+}
+
+# Stub volume deletion function
+function destroy_vol {
+  show_n_log "Please override this function with one suitable for your storage backend." 1
+
+  return 1
+}
+
+###
+# iSCSI ACL credential manipulation functions
+###
+
+# Add a list of IPs allowed to login to a given target.
+function add_initiator_ips {
+  tid=$1
+  IFS=',' read -a initiators <<< "$IP_ACCESS"
+
+  for i in $(seq 1 ${#initiators[@]}); do
+    tgtadm --lld iscsi --op bind --mode target --tid "$tid" --initiator-address "${initiators[i-1]}"
+    show_n_log "Adding initiator: "${initiators[i-1]}"" 2
+  done
+}
+
+# Add a list of initiator IQNs allowed to login to a given target.
+function add_initiator_iqns {
+  tid=$1
+  IFS=',' read -a initiators <<< "$INITIATOR_ACCESS"
+
+  for i in $(seq 1 ${#initiators[@]}); do
+    tgtadm --lld iscsi --op bind --mode target --tid "$tid" --initiator-name "${initiators[i-1]}"
+    show_n_log "Adding initiator: "${initiators[i-1]}"" 2
+  done
+}
+
+# Allow all initiators to login to a given target.
+function allow_all {
+  tid=$1
+
+  tgtadm --lld iscsi --op bind --mode target --tid "$tid" -I ALL
+
+  retval=$?
+  if [ $retval -ne 0 ]; then
+    show_n_log "Error allowing all initiator connections to the iSCSI target!" 1
+    show_n_log "Rolling back! ..." 1
+    delete_target
+    destroy_vol
+    return 1
+  fi
+
+  return 0
+}
+
+###
+# iSCSI CHAP credential manipulation functions
+###
+
+# Add a set of CHAP userID/secret pairs to a particular target
+function add_users {
+    IFS=',' read -a usernames <<< "$USERNAMES"
+    IFS=',' read -a passwords <<< "$PASSWORDS"
+
+    #Chech if the number of users match the number of passwords
+    if [ ${#usernames[@]} -ne ${#passwords[@]} ]; then
+      show_n_log "The number of usernames doesn't match the number of passwords!" 1
+      return 1
+    fi
+
+    for i in $(seq 1 ${#usernames[@]}); do
+      show_n_log "User authentication: "${usernames[i-1]}"" 2
+      tgtadm --lld iscsi --mode account --op new --user "${usernames[i-1]}" --password "${passwords[i-1]}"
+      # Add user to target
+      tgtadm --lld iscsi --mode account --op bind --tid "$tid" --user "${usernames[i-1]}"
+    done
+    return 0
+}
+
+# Delete any CHAP userID/secret paids that are not bound to any iSCSI targets
+function delete_unused_users {
+  users=$(tgtadm --lld iscsi --mode account --op show | sed 's/Account list://')
+
+  for user in $users;
+  do
+    if [ "$(tgtadm --lld iscsi --op show --mode target | grep "$user")" == "" ]; then
+      tgtadm --lld iscsi --mode account --op delete --user "$user"
+      if [ $? -ne 0 ]; then
+        show_n_log "Failed to delete the user "$user"!" 1
+      else
+        show_n_log "The user "$user" was deleted!" 1
+      fi
+    fi
+  done
+}
+
+###
+# iSCSI target functions
+###
+
+# Get the first available unused iSCSI target id number
+function next_tid {
+  # Get all target ids
+  tids=$(tgtadm --lld iscsi --mode target --op show | grep Target | awk '{print $2}' | sed 's/://')
+  
+  if [ -z "$tids" ]; then
+    # There are no targets created. This is going to be the first one.
+    return 1
+  fi
+
+  prev_tid=0
+  chosen_tid=-1
+
+  # Find the first available target id
+  for curr_tid in $tids;
+  do
+    diff=`expr $curr_tid - $prev_tid`
+
+    if [ "$diff" -gt 1 ]; then
+      chosen_tid=`expr $prev_tid + 1`
+      break
+    fi
+  
+    prev_tid=$curr_tid
+  done
+
+  if [ "$chosen_tid" -lt 0 ]; then
+      chosen_tid=`expr $curr_tid + 1`
+  fi
+
+  return $chosen_tid
+}
+
+# Get target id for a given target name
+function get_tid {
+  tid=$(tgtadm --lld iscsi --mode target --op show | grep ":$NAME" | awk '{print $2}' | sed 's/://')
+
+  if [[ "$tid" == "" ]]; then
+    show_n_log "Target not found!" 1
+    show_n_log "Delete operation failed!" 1
+    exit 1
+  fi
+
+  return "$tid"
+}
+
+# Get connection ids and session ids
+function get_connections {
+  # "session0,connection0 session1,connection1"
+  # One session can have several connections.
+
+  tid=$1
+  is_session=0
+  curr_session=0
+
+  # Get sessions and connections
+  for i in $(tgtadm --lld iscsi --op show --mode conn --tid "$tid" | grep -E "Session|Connection")
+  do
+    case $i in
+      Session:) # Set the flag is_session
+        is_session=1
+        ;;
+      Connection:) # Nothing to do here
+        ;;
+      ?)
+        if [ $is_session -eq 1 ]; then # Is a number and is a session number
+          curr_session=$i
+          is_session=0
+        else # Is the connection number. Add a new Session,Connection pair
+          CONNECTIONS="$CONNECTIONS $curr_session,$i"
+        fi
+      ;;
+    esac
+  done
+
+  if [[ "$CONNECTIONS" == "" ]]; then
+    show_n_log "No connections!" 1
+  fi
+
+  return 0
+}
+
+# Create iSCSI target
+function create_target {
+  show_n_log "Creating iSCSI target..." 2
+  # The next few operations need to be serialized.
+  # First, we need to find the next unused target ID using "next_tid".
+  # When we have that, we then need to *immediately* acquire that target ID;
+  # if we don't, a concurrent call to "next_tid" might return the target ID we're using.
+
+  ### BEGIN CRITICAL SECTION
+  # Obtain lock using flock utility.
+  # We need to do so here, in order to ensure that queries to tgtd are serialized.
+  exec 200>$LOCK_FILE
+  flock -w $LOCK_WAIT 200 || return 2
+  # Find the next target id
+  next_tid
+  tid=$?
+
+  show_n_log "Target id: "$tid"" 2
+
+  if [[ $TARGET_IQN ]]; then
+    target_name="$TARGET_IQN"
+  else
+    target_name="$TARGET_IQN_PREFIX":"$NAME"
+  fi
+
+  show_n_log "Target Name: "$target_name"" 2
+
+  # Create new target
+  tgtadm --lld iscsi --mode target --op new --tid "$tid" --targetname "$target_name"
+  if [ $? -ne 0 ]; then
+    show_n_log "Error creating iSCSI target!" 1
+    return 1
+  fi
+
+  # Close the lock
+  flock -u 200
+  exec 200<&-
+  ### END CRITICAL SECTION
+
+  # Check if authentication is required!
+  if [[ $USERNAMES ]] && [[ $PASSWORDS ]]; then
+    add_users "$tid"
+    if [ $? -ne 0 ]; then
+      return 1
+    fi 
+  fi
+
+  if [[ $IP_ACCESS ]]; then
+    add_initiator_ips "$tid"
+    #Some sort of verification is missing
+  else
+    allow_all "$tid"
+    if [ $? -ne 0 ]; then
+      return 1
+    fi
+  fi
+
+  if [[ $INITIATOR_ACCESS ]]; then
+    add_initiator_iqns "$tid"
+  fi
+
+  create_vol "$tid"
+  if [ $? -ne 0 ]; then
+    return 1
+  fi
+
+  show_n_log "Done" 2
+  return 0
+}
+
+# Delete iSCSI target
+function delete_target {
+  show_n_log "Deleting target..." 2
+  # Get target id
+  get_tid
+  tid=$?
+  show_n_log "Target id: "$tid"" 2
+
+  get_connections $tid
+
+  # Put the target offline.
+  # Perform as a loop in a subshell, in the event of transient failure.
+  (
+  for ((i=0; i<${OPERATION_RETRIES=5}; i+=1))
+  do
+     tgt-admin --offline tid="$tid" && break
+     sleep 1
+     false
+  done
+  )
+
+  if [ $? -ne 0 ]; then
+    show_n_log "Error putting the target offline!" 1
+    return 1
+  fi
+
+  # Close connections
+  # Iterate through the list of connections:
+  for connection in $CONNECTIONS
+  do
+    sid=$(echo $connection | cut -d',' -f1)
+    cid=$(echo $connection | cut -d',' -f2)
+    show_n_log "Going to delete the connection "$cid" of the session "$sid"." 2
+
+    tgtadm --op delete --mode conn --tid "$tid" --sid "$sid" --cid "$cid"
+    if [ $? -ne 0 ]; then
+      show_n_log "Error closing the connection "$cid" of the session "$sid"!" 1
+    fi
+  done
+
+  # Actually delete the target.
+  # Perform as a loop in a subshell, in the event of transient failure.
+  (
+  for ((i=0; i<${OPERATION_RETRIES=5}; i+=1))
+  do
+     tgtadm --lld iscsi --mode target --op delete --force --tid "$tid" && break
+     sleep 1
+     false
+  done
+  )
+
+  if [ $? -ne 0 ]; then
+    show_n_log "Error deleting the iSCSI target!" 1
+    return 1
+  fi
+
+  delete_unused_users
+  return 0
+}
+
+# List currently active iSCSI targets
+function list_targets {
+  if [ "$(whoami)" != "root" ]; then
+    echo "Root privileges are required for the list operation!"
+    exit 1
+  else
+    echo -e "Current iSCSI targets:"
+    tgtadm --lld iscsi --mode target --op show
+    exit 0
+  fi   
+}
+
+###
+# Utility functions, and a standard "main()" function to call.
+###
+
+# Print message depending on the log level
+function show_n_log {
+  msg=$1
+  level=$2
+  date_time=$(date "+%Y-%m-%d %H:%M:%S")
+
+  if [ $LOG_LEVEL -ge $level ]; then
+    echo $msg
+  fi
+  
+  #Write msg to the log file. All messages are written (= verbose)
+  echo ""$date_time" - "PID $$, PPID $PPID" - "$msg"" >> "$LOG_DIR"/iscsi-manager.log
+}
+
+# Print usage message
+function usage {
+  echo ""
+  echo "Usage:"
+  echo "$0 operation [options] [parameters]"
+  echo ""
+  echo "Operations:"
+  echo "-c  Create - Create a new virtual block device and export through iSCSI."
+  echo "-d  Delete - Delete an existing iSCSI target and associated virtual block device."
+  echo "-l  List - Discover existing iSCSI targets."
+  echo "-h  Help - Show this message."
+  echo ""
+  echo "Parameters:"
+  echo "-n  Name - Virtual block device's name. Not required if the target name is set."
+  echo "-m  Number - LUN number to present for target."
+  echo "-s  Size - Size of the virtual block device. Only required for the create operation."
+  echo "-g  Volume Group - Name of the Volume Group in which the virtual block device should be created. If not set, the default will be used"
+  echo "-t  Target IQN name - Set a different IQN for the target. If not set, the default prefix and the name set will be used."
+  echo "-u  Username(s) - Set username(s) for authentication. Should be seperated by commas. If a username is set, a password must also be set."
+  echo "-p  Password(s) - Set password(s) for authentication. Should be seperated by commas. If a password is set, a username must also be set."
+  echo "-a  Access Control - IP address(es) of the allowed initiators. Should be seperated by commas. If not set all initiators will be allowed."
+  echo "-i  Access Control - IQNs of the allowed initiators. Should be seperated by commas. If not set all initiators will be allowed."
+  echo 
+  echo "Options:"
+  echo "-q  Quiet - Disable aditional output and don't ask user to confirm operations. In this mode the script only displays the created iSCSI target."
+  echo "-v  Verbose - Print extra messages."
+  echo ""
+  echo "Examples:"
+  echo "$0 -l"
+  echo "$0 -c -n data1 -s 10GB -g VGiscsi"
+  echo "$0 -d -q -n data1"
+  echo "$0 -c -t iqn.2013-04.net.uvalight.openlab.xo:data1 -s 1G -u user1,user2 -p pass1,pass2 -a 127.0.0.1,10.211.55.2"
+  echo ""
+  echo "Note: Root privileges are required!"
+}
+
+# General "main()" function; you may call this after having defined your $CONF_FILE variable.
+function main {
+  source $CONF_FILE
+  
+  if [ $? -ne 0 ]; then
+    show_n_log "Failed to source configuration file: $CONF_FILE" 1
+    exit 1
+  fi
+  
+  CREATE=0
+  DELETE=0
+  CONNECTIONS=""
+  
+  # Parse arguments
+  while getopts “g:u:p:lt:a:i:qvn:m:s:dch” OPTION
+  do
+    case $OPTION in
+      c)
+        CREATE=1
+        ;;
+      d)
+        DELETE=1
+        ;;
+      n)
+        NAME=$OPTARG
+        ;;
+      m)
+        LUN_ID=$OPTARG
+        ;;
+      t)
+        TARGET_IQN=$OPTARG
+        ;;
+      s)
+        SIZE=$OPTARG
+        ;;
+      g)
+        POOL=$OPTARG
+        ;;
+      u)
+        USERNAMES=$OPTARG
+        ;;
+      p)
+        PASSWORDS=$OPTARG
+        ;;
+      a)
+        IP_ACCESS=$OPTARG
+        ;;
+      i)
+        INITIATOR_ACCESS=$OPTARG
+        ;;
+      l)
+        list_targets
+        ;;
+      q)
+        LOG_LEVEL=0
+        CONTINUE="yes"
+        ;;
+      v)
+        LOG_LEVEL=2
+        ;;
+      h)
+        usage
+        exit 0
+        ;;
+      ?)
+        usage
+        exit 1
+        ;;
+    esac
+  done
+  
+  if [[ $CREATE -eq 1 ]] && ([[ $NAME ]] || [[ $TARGET_IQN ]]) && [[ $SIZE ]]; then
+  
+    if [ "$(whoami)" != "root" ]; then
+      echo "Root privileges are required for the create operation!"
+      exit 1
+    fi
+  
+    if [ -z "$NAME" ]; then
+      NAME=$(echo $TARGET_IQN | cut -f 2 -d ':')
+    fi
+  
+    create_target
+    rc="$?"
+    if [ "$rc" -ne 0 ]; then
+      if [ "$rc" -eq 2]; then
+        show_n_log "Unable to acquire iSCSI target ID before lock timeout!" 1
+      fi
+      exit 1
+    fi
+    
+    show_n_log "iSCSI target:" 1
+    if [[ $TARGET_IQN ]]; then
+      show_n_log "$TARGET_IQN" 0
+    else
+      show_n_log ""$TARGET_IQN_PREFIX":"$NAME"" 0
+    fi
+   
+  elif [[ $DELETE -eq 1 ]] && ([[ $NAME ]] || [[ $TARGET_IQN ]]); then
+  
+    if [ "$(whoami)" != "root" ]; then
+      echo "Root privileges are required for the delete operation!"
+      exit 1
+    fi
+  
+    if [ -z "$CONTINUE" ]; then
+      echo -e "The logical volume "$NAME" in the volume group "$POOL" is going to be deleted!\n\nAre you sure you want to proceed? [no]  \c"
+      read CONTINUE
+    fi
+  
+    if [ "$CONTINUE" == "yes" ]; then
+      if [ -z "$NAME" ]; then
+        NAME=$(echo $TARGET_IQN | cut -f 2 -d ':')
+      fi
+      delete_target
+  
+      if [ "$?" -ne 0 ]; then
+        show_n_log "Delete operation failed!" 1
+        exit 1
+      fi
+  
+      destroy_vol
+  
+      if [ "$?" -ne 0 ]; then
+        show_n_log "Delete operation failed!" 1
+        exit 1
+      fi
+  
+    elif [ "$CONTINUE" == "" ] || [ "$CONTINUE" == "no" ]; then
+      show_n_log "Delete operation canceled!" 1
+    else
+      show_n_log "Invalid option! The options are \"yes\" and \"no\"" 1
+      show_n_log "Delete operation canceled!" 1
+      exit 1
+    fi
+  
+  else
+    echo "Missing or invalid arguments."
+    usage
+    exit 1
+  fi
+  
+  exit 0
+}

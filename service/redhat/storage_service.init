@@ -1,0 +1,68 @@
+#! /bin/sh
+#
+# storage_service      Start up the storage_serviced storage provisioning daemon.
+#
+# chkconfig: 2345 55 25
+# description: storage_service provides an authenticated XMLRPC interface for provisioning storage. \
+#              This service starts up the storage_service daemon.
+#
+
+### BEGIN INIT INFO
+# Provides:          storage_service
+# Required-Start:    $network
+# Required-Stop:     $network
+# Default-Start:     S
+# Default-Stop:      0 6
+# Short-Description: storage_service storage provisioning daemon
+# Description:       Receives requests for the creation and deletion of storage for cloud sites.
+### END INIT INFO
+
+# Author: Victor J. Orlikowski <vjo@duke.edu>
+#
+
+# source function library
+. /etc/rc.d/init.d/functions
+
+RETVAL=0
+prog="storage_serviced"
+lockfile=/var/lock/subsys/$prog
+
+# pull in sysconfig settings
+[ -f /etc/sysconfig/$prog ] && . /etc/sysconfig/$prog
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+DESC="storage_service storage provisioning daemon"
+NAME=storage_service
+SCRIPTNAME=/etc/init.d/${NAME}
+PROGDIR=/opt/${NAME}/bin
+PIDFILE=/var/run/$prog.pid
+STORAGE_SERVICED=${PROGDIR}/$prog
+
+case "$1" in
+  start)
+	echo -n $"Starting $prog: "
+        . ${PROGDIR}/activate
+	$STORAGE_SERVICED start && success || failure
+	RETVAL=$?
+	echo
+	;;
+  stop)
+	echo -n $"Stopping $prog: "
+        . ${PROGDIR}/activate
+	$STORAGE_SERVICED stop && success || failure
+	RETVAL=$?
+	echo
+	;;
+  restart|force-reload)
+	echo -n $"Restarting $prog: "
+        . ${PROGDIR}/activate
+	$STORAGE_SERVICED restart && success || failure
+	RETVAL=$?
+	echo
+	;;
+  *)
+	echo "Usage: $SCRIPTNAME {start|stop|restart}" >&2
+	exit 3
+	;;
+esac
+exit $RETVAL
