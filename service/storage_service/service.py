@@ -206,33 +206,37 @@ class StorageService():
         return [output, returncode]
 
     def run(self):
-        import gevent.monkey
-        gevent.monkey.patch_all()
+        try :
+            import gevent.monkey
+            gevent.monkey.patch_all()
 
-        server_address = (CONFIG.get('network', 'listen-host'),
+            server_address = (CONFIG.get('network', 'listen-host'),
                           CONFIG.getint('network', 'listen-port'))
-        self.server = SecureXMLRPCServer(server_address, SecureXMLRPCRequestHandler)
+            self.server = SecureXMLRPCServer(server_address, SecureXMLRPCRequestHandler)
 
-        # Set process name
-        setproctitle('storage_serviced')
+            # Set process name
+            setproctitle('storage_serviced')
 
-        # Register functions
-        self.server.register_function(self.create, 'create')
-        self.server.register_function(self.delete, 'delete')
+            # Register functions
+            self.server.register_function(self.create, 'create')
+            self.server.register_function(self.delete, 'delete')
 
-        # Read users file
-        from passlib.apache import HtpasswdFile
-        passwd_file = CONFIG.get('runtime', 'passwd-file')
-        try:
-            self.server.users = HtpasswdFile(passwd_file)
-        except:
-            self.logger.error("Could not open authentication file %s"
-                              % passwd_file)
+            # Read users file
+            from passlib.apache import HtpasswdFile
+            passwd_file = CONFIG.get('runtime', 'passwd-file')
+            try:
+                self.server.users = HtpasswdFile(passwd_file)
+            except:
+                self.logger.error("Could not open authentication file %s"
+                                  % passwd_file)
 
-        self.logger.info("Storage service running as PID %d" % os.getpid())
-        self.logger.info("Listening on %s:%d" % server_address)
-        signal.signal(signal.SIGTERM, self.stop_handler)
-        self.server.serve_forever()
+            self.logger.info("Storage service running as PID %d" % os.getpid())
+            self.logger.info("Listening on %s:%d" % server_address)
+            signal.signal(signal.SIGTERM, self.stop_handler)
+            self.server.serve_forever()
+        except Exception as e:
+            self.logger.info('Exception was of type: %s' % (str(type(e))))
+            self.logger.info("Exception= : %s" % (str(e)))
 
     def stop_handler(self, signum, frame):
         try:
@@ -303,7 +307,8 @@ def main():
         logging.error("Exiting...")
         sys.exit(1)
 
-    from daemon import runner, pidlockfile
+    from daemon import runner
+    #from daemon import runner, pidlockfile
 
     service = StorageService()
     daemon_runner = runner.DaemonRunner(service)
@@ -350,8 +355,9 @@ def main():
             daemon_runner.daemon_context.files_preserve = [ handler.stream, ]
 
         try:
-            service_logger.info("Administrative operation: %s" % args[0])
+            service_logger.info("Administrative operation : %s " % args[0])
             daemon_runner.do_action()
+            service_logger.info("Administrative operation : complete")
         except runner.DaemonRunnerStopFailureError, drsfe:
             service_logger.propagate = True
             service_logger.error("Unable to stop service; reason was: %s" % str(drsfe))
